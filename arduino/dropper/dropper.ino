@@ -15,10 +15,12 @@
  DISPLAY: {I2C} OLED Display 128x64 (SSD1306) [IO22:SCL][IO21:SDA] {This is default I2C used on Wire lib for ESP32}
  RGB_LED: {OUT} Common RGB LED VCC common [IO19:RED][IO18:GREEN][IO5:BLUE]
  BUZZER:  {OUT} Common buzzer output [IO25]
- ENCODER: {IN} Rotatory Encoder [IO26:CLK][IO27:DT][IO14:SW]
+ ENCODER: {IN} Rotatory Encoder TWO03 [IO26:CLK][IO27:DT][IO14:SW]
 
  **************************************************************************/
 
+#include <Arduino.h>
+#include <RotaryEncoder.h>
 #include <math.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -43,21 +45,47 @@
 #define SCREEN_ADDRESS 0x3C   //< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Timeout not interacting with setup
+#define SCREEN_SETUP_TIMEOUT 30 // In seconds
+
+//== ROTATORY ENCODER =========================================================
+
+#define ROTATORY_IN1 26
+#define ROTATORY_IN2 27
+#define ROTATORY_SWT 14
+
+// Setup a RotaryEncoder with 2 steps per latch for the 2 signal input pins:
+RotaryEncoder encoder(ROTATORY_IN1, ROTATORY_IN2, RotaryEncoder::LatchMode::TWO03);
+
 //== GLOBAL VARIABLES =========================================================
 
-// System Display Values
+// System State
+char display_mode = 'D';  // D = Default, S = Setings
+int setup_timout  = 0;    // Timout seup screen
+
+// Display Values
 int battery_status  = 0;
 int drops_second    = 88;
 int milliliters_sec = 888;
 int total_volume    = 888;
 float set_drops_sec = 8.8;
 
+// Rotatory Encoder
+int encoder_pos   = 0;
+int encoder_click = 0;
+
 // Update Timers
 int update_medium  = 0;   // Update every 1 second
 int update_long    = 0;   // Update every 10 seconds
+int update_test    = 0;
+bool refresh_med   = false;
+bool refresh_long  = false;
+bool refresh_disp  = false; 
 
 // Temp variables
-int tmp_stamp = 0;
+int tmp_stamp  = 0;
+int tmp_stamp2 = 0;
+int tmp_pos    = 0;
 char tmp_char10[10];
 
 // Multicore Tasks 
@@ -73,6 +101,21 @@ TaskHandle_t Task2;
  */
 void setup() {
   Serial.begin(115200); // Default speed for ESP32
+  //
+  uint32_t Freq = 0;
+  setCpuFrequencyMhz(80);
+  Freq = getCpuFrequencyMhz();
+  Serial.print("CPU Freq = ");
+  Serial.print(Freq);
+  Serial.println(" MHz");
+  Freq = getXtalFrequencyMhz();
+  Serial.print("XTAL Freq = ");
+  Serial.print(Freq);
+  Serial.println(" MHz");
+  Freq = getApbFrequency();
+  Serial.print("APB Freq = ");
+  Serial.print(Freq);
+  Serial.println(" Hz");
 
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -90,9 +133,11 @@ void setup() {
   // display.drawLine(0, 15, display.width()-1, 15, SSD1306_WHITE);
   // display.drawLine(0, 16, display.width()-20, 16, SSD1306_WHITE);
   // display.drawLine(0, display.height() - 1, display.width()-20, display.height() - 1, SSD1306_WHITE);
-  
-  prepareDisplay();
+  prepareDefaultScreen();
   display.display();
+
+  // Inputs
+  pinMode(ROTATORY_SWT, INPUT_PULLUP);
 
   Serial.println(F("# Setup Finished"));
   Serial.print("# Setup running on core: ");
@@ -130,6 +175,8 @@ void loop() {}
 
 /**
  * Core 0 Loop
+ *
+ * Background monitoring
  */
 void Task1code( void * pvParameters ){
   Serial.print("Task1 running on core ");
@@ -137,25 +184,45 @@ void Task1code( void * pvParameters ){
 
   // Main Task Loop HERE
   for (;;) {
-    Serial.print("[TASK_1] Core: ");
-    Serial.println(xPortGetCoreID());
-    delay(1300);
-    if (battery_status >= 100) {
-      battery_status = 0;
-    } else {
-      battery_status++;
+    
+
+    tmp_stamp2 = round(millis() / 1000);
+    if (update_test != tmp_stamp2) {
+      // Serial.print("[TASK_1] Core: ");
+      // Serial.println(xPortGetCoreID());
+
+      if (battery_status >= 100) {
+        battery_status = 0;
+      } else {
+        battery_status++;
+      }
+
+      if (drops_second >= 99) {
+        drops_second = 0;
+      } else {
+        drops_second++;
+      }
+      update_test = tmp_stamp2;
     }
 
-    if (drops_second >= 99) {
-      drops_second = 0;
-    } else {
-      drops_second++;
-    }
+    //
+    // encoder.tick();
+    // int newPos = encoder.getPosition();
+    // if (encoder_pos != newPos) {
+    //   encoder_pos = newPos;
+    //   Serial.print("pos:");
+    //   Serial.print(newPos);
+    //   Serial.print(" dir:");
+    //   newPos = (int)encoder.getDirection();
+    //   Serial.println(newPos);
+    // } 
+    
+
     // Add a small delay to let the watchdog process
     //https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
-    delay(50);
+    delay(1);
   }
- 
+
 }
 
 /**
@@ -167,35 +234,104 @@ void Task2code( void * pvParameters ){
 
   // Main Task Loop HERE
   for (;;) {
-    
+    // Timestamp in seconds
+    tmp_stamp    = round(millis() / 1000);
+    refresh_med  = false;
+    refresh_long = false;
+    refresh_disp = false;
+
     // Update on 1fps
-    tmp_stamp = round(millis() / 1000);
     if (update_medium != tmp_stamp) {
-      Serial.print("[TASK_2][FPS01] Core: ");
-      Serial.println(xPortGetCoreID());
-
-      update_medium = tmp_stamp;
-      updateTime();
-      updateValues();
-      display.display();
+        update_medium = tmp_stamp;
+        refresh_med   = true;
     } 
-
     // Update ~10 fps
     if (update_long < tmp_stamp) {
-      Serial.print("[TASK_2][FPS10] Core: ");
-      Serial.println(xPortGetCoreID());
+      update_long  = tmp_stamp + 10;
+      refresh_long = true;
+    }
 
-      update_long = tmp_stamp + 10;
+    // Detect encode change
+    encoder.tick();
+    tmp_pos = encoder.getPosition();
+    if (encoder_pos != tmp_pos) {
+      Serial.print("pos:");
+      Serial.print(tmp_pos);
+      Serial.print(" dir:");
+      Serial.println((int)(encoder.getDirection()));
+      encoder_pos = tmp_pos;
+      if (display_mode == 'S') {
+        setup_timout = tmp_stamp + SCREEN_SETUP_TIMEOUT;
+      }
+    } // if
+
+    // Read the state of the pushbutton value:
+    if (digitalRead(ROTATORY_SWT) == LOW) {
+      Serial.println("[ROTATORY_SWT:LOW]");
+      if (encoder_click == 0) {
+        if (display_mode == 'D') {
+          display_mode = 'S';
+          prepareSetupScreen();
+          refresh_disp = true;
+          refresh_med  = true;
+          refresh_long = true;
+        }
+        setup_timout = tmp_stamp + SCREEN_SETUP_TIMEOUT;
+      }
+      encoder_click++;
+    } else {
+      encoder_click = 0;
+    }
+
+    // Default Display Mode 
+    if (display_mode == 'D') {
+      // Update on 1fps
+      if (refresh_med) {
+        updateValues();
+        refresh_disp = true;
+      } 
+      // // Update ~10 fps
+      // if (refresh_long) {
+      //   updateBattery();
+      //   refresh_disp = true;
+      // }
+    } 
+    // Setup Display Mode
+    else {
+      // SCREEN_SETUP_TIMEOUT
+      // Update on 1fps
+      if (refresh_med) {
+        
+        //display.display();
+      } 
+
+      // Check display  setup timeout
+      if (tmp_stamp > setup_timout) {
+        display_mode = 'D';
+        prepareDefaultScreen();
+        refresh_disp = true;
+      }
+    }
+
+    // Header bar always display
+    // Update on 1fps
+    if (refresh_med) {
+      updateTime();
+      refresh_disp = true;
+    } 
+    // Update ~10 fps
+    if (refresh_long) {
       updateBattery();
+      refresh_disp = true;
+    }
+
+    if (refresh_disp) {
       display.display();
-      // Serial.print(F("# Battery: "));
-      // Serial.print(battery_status);
-      // Serial.println(F("%"));
     }
     
     // Add a small delay to let the watchdog process
     //https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
-    delay(50); // Pause for 0.05 second
+    delay(1); // Pause for 0.05 second
   }
 }
 
@@ -203,14 +339,12 @@ void Task2code( void * pvParameters ){
 //== FUNCTIONS ================================================================
 //=============================================================================
 
-/**
- * Prepare display with fixed drawn parts and labels
- */
-void prepareDisplay()
-{
-  // Clear display buffer
-  display.clearDisplay(); 
 
+/**
+ * Prepare display yellow header
+ */
+void prepareHeader()
+{
   // [Yellow Bar] Battery Body Outer Line
   display.drawLine(110,  6, 110, 11, SSD1306_WHITE);
   display.drawLine(111,  6, 111, 11, SSD1306_WHITE);
@@ -218,6 +352,16 @@ void prepareDisplay()
   display.drawLine(125,  4, 125, 13, SSD1306_WHITE);
   display.drawLine(112,  4, 125,  4, SSD1306_WHITE);
   display.drawLine(112, 13, 125, 13, SSD1306_WHITE);
+}
+
+/**
+ * Prepare display with fixed drawn parts and labels
+ */
+void prepareDefaultScreen()
+{
+  // Clear display buffer
+  display.clearDisplay(); 
+  prepareHeader();
 
   // Separator
   display.drawLine(0 , 16, MAX_WIDTH,  16, SSD1306_WHITE);        // Header Line
@@ -241,6 +385,19 @@ void prepareDisplay()
   // Gotas por segundo
   display.setCursor(82, 53); 
   display.print(F("gotas/s"));
+
+}
+
+void prepareSetupScreen()
+{
+  // Clear display buffer
+  display.clearDisplay();
+  prepareHeader();
+
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.print(F("SETUP @@@@@@@@@@@@@@")); 
 
 }
 
