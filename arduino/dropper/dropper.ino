@@ -20,11 +20,13 @@
  **************************************************************************/
 
 #include <Arduino.h>
+#include <math.h>
 #include <RotaryEncoder.h>
 #include <math.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
+#include <Preferences.h>
 
 //== SCREEN DFINITIONS ========================================================
 
@@ -55,38 +57,60 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define ROTATORY_SWT 14
 
 // Setup a RotaryEncoder with 2 steps per latch for the 2 signal input pins:
-RotaryEncoder encoder(ROTATORY_IN1, ROTATORY_IN2, RotaryEncoder::LatchMode::TWO03);
+RotaryEncoder encoder(ROTATORY_IN1, ROTATORY_IN2, RotaryEncoder::LatchMode::FOUR3);
+
+//== PERSISTENT CONFIG ========================================================
+
+Preferences preferences;
+
+//== SENSORS ==================================================================
+
+#define IR_SENSOR 34
 
 //== GLOBAL VARIABLES =========================================================
 
 // System State
 char display_mode = 'D';  // D = Default, S = Setings
 int setup_timout  = 0;    // Timout seup screen
+int alert_buzzer  = 0;
+bool save_changes = false;
+float ml_per_drop = 0.05; // 0.05ml per drop or 1ml has 20 drops
 
 // Display Values
-int battery_status  = 0;
-int drops_second    = 88;
-int milliliters_sec = 888;
-int total_volume    = 888;
-float set_drops_sec = 8.8;
+int battery_status         = 0;
+int drops_second           = 0;
+float milliliters_hour     = 0;
+float total_volume         = 0;
+float set_drops_sec        = 0;
+unsigned long header_timer = 0;
 
 // Rotatory Encoder
 int encoder_pos   = 0;
 int encoder_click = 0;
+int encoder_dir   = 0;
 
 // Update Timers
+unsigned long update_fast = 0;   // Update every 0.1 second (10fps)
 int update_medium  = 0;   // Update every 1 second
 int update_long    = 0;   // Update every 10 seconds
-int update_test    = 0;
+int update_ir      = 0;   // IR timer update 1sec
+bool refresh_fast  = false;
 bool refresh_med   = false;
 bool refresh_long  = false;
 bool refresh_disp  = false; 
 
+// Menu
+int menu_pos     = 0;
+bool menu_change = false;
+int menu_select  = 0;
+
 // Temp variables
+unsigned long tmp_millis  = 0;
 int tmp_stamp  = 0;
 int tmp_stamp2 = 0;
 int tmp_pos    = 0;
 char tmp_char10[10];
+int tmp_int    = 0;
 
 // Multicore Tasks 
 TaskHandle_t Task1;
@@ -133,11 +157,13 @@ void setup() {
   // display.drawLine(0, 15, display.width()-1, 15, SSD1306_WHITE);
   // display.drawLine(0, 16, display.width()-20, 16, SSD1306_WHITE);
   // display.drawLine(0, display.height() - 1, display.width()-20, display.height() - 1, SSD1306_WHITE);
+  resetData();
   prepareDefaultScreen();
   display.display();
 
   // Inputs
   pinMode(ROTATORY_SWT, INPUT_PULLUP);
+  pinMode(IR_SENSOR, INPUT);
 
   Serial.println(F("# Setup Finished"));
   Serial.print("# Setup running on core: ");
@@ -173,6 +199,30 @@ void setup() {
  */
 void loop() {}
 
+bool refresh_ir   = false;
+bool refresh_drop = false;
+unsigned long tmp_millis2  = 0;
+int update_drop  = 0;
+unsigned long noise_lock = 0;
+
+int loop_counter = 0;
+int noise_range  = 150;
+int ir_millis_v  = 0;
+int ir_line      = 0;
+int diff_noise   = 0;
+int drop_count   = 0;
+int still_high   = 0;
+int noise_time   = 25;
+
+// Init Drops List
+int drops_leng    = 10;
+int drops_list[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// Iem Position 0 ~ 5
+int drops_pos  = 0;
+int drops_temp = 0;
+
+int drop_view  = 0;
+
 /**
  * Core 0 Loop
  *
@@ -184,40 +234,101 @@ void Task1code( void * pvParameters ){
 
   // Main Task Loop HERE
   for (;;) {
-    
 
-    tmp_stamp2 = round(millis() / 1000);
-    if (update_test != tmp_stamp2) {
-      // Serial.print("[TASK_1] Core: ");
-      // Serial.println(xPortGetCoreID());
+    tmp_millis2  = millis();
+    tmp_stamp2   = round(tmp_millis2 / 1000);
+    refresh_ir   = false;
+    refresh_drop = false;
+    if (update_ir < tmp_millis2) {
+        update_ir  = tmp_millis2 + 100;
+        refresh_ir = true;
+    }
+    if (update_drop < tmp_stamp2) {
+      update_drop  = tmp_stamp2;
+      refresh_drop = true;
+    }
+    // We don't need check voltage, only changes spikes
+    ir_millis_v  = analogReadMilliVolts(IR_SENSOR);
+    loop_counter++;
 
-      if (battery_status >= 100) {
-        battery_status = 0;
-      } else {
-        battery_status++;
-      }
-
-      if (drops_second >= 99) {
-        drops_second = 0;
-      } else {
-        drops_second++;
-      }
-      update_test = tmp_stamp2;
+    // Medium line it take sample each 0.1 ms
+    if (refresh_ir) {
+      ir_line = (int) (ir_millis_v + (ir_line * 3)) / 4; // More slow medium change
     }
 
-    //
-    // encoder.tick();
-    // int newPos = encoder.getPosition();
-    // if (encoder_pos != newPos) {
-    //   encoder_pos = newPos;
-    //   Serial.print("pos:");
-    //   Serial.print(newPos);
-    //   Serial.print(" dir:");
-    //   newPos = (int)encoder.getDirection();
-    //   Serial.println(newPos);
-    // } 
-    
+    // Only medium over time
+    //ir_line    = (int) (ir_millis_v + (ir_line * 4)) / 5; // More slow medium change
+    diff_noise = abs((int)(ir_millis_v - ir_line));
 
+    // Serial.print(ir_millis_v);
+    // Serial.print(' ');
+    // Serial.print(ir_line);
+    // Serial.print(' ');
+    // Serial.print(diff_noise);
+    // Serial.print(' ');
+
+    if (abs(diff_noise) > noise_range) {
+      if (still_high == 0) {
+        drop_count++;
+        // Lock time noise in milli seconds
+        noise_lock = tmp_millis2 + noise_time;
+      }
+      still_high++;
+    } else {
+      if (tmp_millis2 > noise_lock) {
+        still_high = 0;
+      }
+    }
+
+    if (refresh_drop) {
+      drop_view = drop_count;
+    }
+
+    // if (still_high > 0) {
+    //   Serial.println(200);
+    // } else {
+    //   Serial.println(100);
+    // }
+   
+    //Update on 1fps
+    if (refresh_drop) {
+        // Register on rotative list (6 indexes)
+        drops_list[drops_pos] = drop_count * 10;
+        drops_pos++;
+        if (drops_pos >= drops_leng) {
+          drops_pos = 0;
+        }
+        // Get medium
+        drops_temp = 0;
+        for (tmp_int = 0; tmp_int < drops_leng; tmp_int++) {
+          drops_temp += drops_list[tmp_int];
+        }
+        drops_second = round(drops_temp / drops_leng);
+
+        //drops_second = round((drops_second + (drop_count * 30)) / 4); // 3 x More power over new counter
+        if (drops_second > 99) {
+          drops_second = 99;
+        }
+        // Add totals
+        total_volume += drop_count * ml_per_drop;
+        // ml/h
+        milliliters_hour = (drops_second * 3600 * ml_per_drop) / 10; // (Drops/s * ml_per_drop * 60 min * 60 sec) / 10 (original count is *10)
+
+        Serial.print("[LOOP:");
+        Serial.print(loop_counter);
+        Serial.print("][DROP: ");
+        Serial.print(drop_count);
+        Serial.print("][TOTAL:");
+        Serial.print(drops_temp);
+        Serial.print("][ML/H:");
+        Serial.print(milliliters_hour);
+        Serial.print("] DROP/S: ");
+        Serial.println(drops_second);
+
+        loop_counter = 0;
+        drop_count   = 0;
+    } 
+    
     // Add a small delay to let the watchdog process
     //https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
     delay(1);
@@ -235,10 +346,18 @@ void Task2code( void * pvParameters ){
   // Main Task Loop HERE
   for (;;) {
     // Timestamp in seconds
-    tmp_stamp    = round(millis() / 1000);
+    tmp_millis   = millis();
+    tmp_stamp    = round(tmp_millis / 1000);
+    refresh_fast = false;
     refresh_med  = false;
     refresh_long = false;
     refresh_disp = false;
+
+    // Update on 0.1fps
+    if (update_fast < tmp_millis) {
+        update_fast  = tmp_millis + 100;
+        refresh_fast = true;
+    } 
 
     // Update on 1fps
     if (update_medium != tmp_stamp) {
@@ -254,27 +373,82 @@ void Task2code( void * pvParameters ){
     // Detect encode change
     encoder.tick();
     tmp_pos = encoder.getPosition();
+    //int menu_pos     = 0;
     if (encoder_pos != tmp_pos) {
-      Serial.print("pos:");
-      Serial.print(tmp_pos);
-      Serial.print(" dir:");
-      Serial.println((int)(encoder.getDirection()));
       encoder_pos = tmp_pos;
+      encoder_dir = (int)(encoder.getDirection());
+      menu_change = true;
+      if (encoder_dir == 1) { //-1 = RotaryEncoder::Direction::COUNTERCLOCKWISE, 1 = RotaryEncoder::Direction::CLOCKWISE
+        menu_pos++;
+      } else {
+        menu_pos--;
+      }
+      // Limiter
+      if (menu_pos < 0) {
+        menu_pos  = 0;
+      } else if (menu_pos > 3) {
+        menu_pos  = 3;
+      }
+
+      // Change Referencia
+      if (display_mode == 'D') {
+        if (encoder_dir == 1) { //-1 = RotaryEncoder::Direction::COUNTERCLOCKWISE, 1 = RotaryEncoder::Direction::CLOCKWISE
+          set_drops_sec = set_drops_sec + 0.1;
+        } else {
+          set_drops_sec = set_drops_sec - 0.1;
+        }
+        if (set_drops_sec >= 10 ) {
+          set_drops_sec = 9.9;
+        } else if (set_drops_sec < 0) {
+          set_drops_sec = 0;
+        }
+        save_changes = true;
+      }
+
       if (display_mode == 'S') {
         setup_timout = tmp_stamp + SCREEN_SETUP_TIMEOUT;
       }
-    } // if
+
+      // Serial.print("pos:");
+      // Serial.print(tmp_pos);
+      // Serial.print(", dir:");
+      // Serial.print(encoder_dir);
+      // Serial.print(", menu:");
+      // Serial.println(menu_pos);
+    }
 
     // Read the state of the pushbutton value:
     if (digitalRead(ROTATORY_SWT) == LOW) {
-      Serial.println("[ROTATORY_SWT:LOW]");
       if (encoder_click == 0) {
+        Serial.println("[ROTATORY_SWT:LOW]");
         if (display_mode == 'D') {
           display_mode = 'S';
           prepareSetupScreen();
           refresh_disp = true;
           refresh_med  = true;
           refresh_long = true;
+        } else if (display_mode == 'S') {
+          if (menu_pos == 0) { // Bipi
+            if (alert_buzzer == 0) {
+              alert_buzzer = 1;
+            } else {
+              alert_buzzer = 0;
+            }
+            save_changes = true;
+          } else if (menu_pos == 1) { // Reset
+            resetData();
+            display_mode = 'D';
+            prepareDefaultScreen();
+            refresh_disp = true;
+            refresh_med  = true;
+            refresh_long = true;
+          } else {  // Exit
+            display_mode = 'D';
+            prepareDefaultScreen();
+            refresh_disp = true;
+            refresh_med  = true;
+            refresh_long = true;
+          }
         }
         setup_timout = tmp_stamp + SCREEN_SETUP_TIMEOUT;
       }
@@ -285,30 +459,27 @@ void Task2code( void * pvParameters ){
 
     // Default Display Mode 
     if (display_mode == 'D') {
-      // Update on 1fps
-      if (refresh_med) {
+      // Update on 10fps
+      if (refresh_fast) {
         updateValues();
         refresh_disp = true;
       } 
-      // // Update ~10 fps
-      // if (refresh_long) {
-      //   updateBattery();
-      //   refresh_disp = true;
-      // }
     } 
     // Setup Display Mode
     else {
       // SCREEN_SETUP_TIMEOUT
-      // Update on 1fps
-      if (refresh_med) {
-        
-        //display.display();
+      // Update on 0.1fps
+      if (refresh_fast) {
+        refresh_disp = true;
+        updateSetup();
       } 
 
       // Check display  setup timeout
       if (tmp_stamp > setup_timout) {
         display_mode = 'D';
         prepareDefaultScreen();
+        refresh_med  = true;
+        refresh_long = true;
         refresh_disp = true;
       }
     }
@@ -323,6 +494,11 @@ void Task2code( void * pvParameters ){
     if (refresh_long) {
       updateBattery();
       refresh_disp = true;
+      if (save_changes) {
+        save_changes = false;
+        savePreferences();
+      }
+      battery_status += 3;
     }
 
     if (refresh_disp) {
@@ -339,19 +515,74 @@ void Task2code( void * pvParameters ){
 //== FUNCTIONS ================================================================
 //=============================================================================
 
+/**
+ * Load persistent preferences
+ */
+void loadPreferences()
+{
+  // Persistent Storage
+  // Open Preferences with my-app namespace. Each application module, library, etc
+  // has to use a namespace name to prevent key name collisions. We will open storage in
+  // RW-mode (second parameter has to be false).
+  // Note: Namespace name is limited to 15 chars.
+  preferences.begin("dropper", true);
+
+  // Get the counter value, if the key does not exist, return a default value of 0
+  // Note: Key name is limited to 15 chars.
+  alert_buzzer   = preferences.getInt("alert_buzzer", 0);
+  set_drops_sec  = preferences.getFloat("set_drops_sec", 0);
+  
+  // Close the Preferences
+  preferences.end();
+}
+
+/**
+ * Load persistent preferences
+ */
+void savePreferences()
+{
+  // Persistent Storage
+  // Open Preferences with my-app namespace. Each application module, library, etc
+  // has to use a namespace name to prevent key name collisions. We will open storage in
+  // RW-mode (second parameter has to be false).
+  // Note: Namespace name is limited to 15 chars.
+  preferences.begin("dropper", false);
+
+  // Store the counter to the Preferences
+  preferences.putInt("alert_buzzer", alert_buzzer);
+  preferences.putFloat("set_drops_sec", set_drops_sec);
+
+  // Close the Preferences
+  preferences.end();
+}
+
+/**
+ * Reset Data 
+ */
+void resetData() {
+  battery_status   = 0;
+  drops_second     = 0;
+  milliliters_hour = 0;
+  total_volume     = 0;
+  header_timer     = millis();
+  loadPreferences();
+}
 
 /**
  * Prepare display yellow header
  */
 void prepareHeader()
 {
-  // [Yellow Bar] Battery Body Outer Line
-  display.drawLine(110,  6, 110, 11, SSD1306_WHITE);
-  display.drawLine(111,  6, 111, 11, SSD1306_WHITE);
-  display.drawLine(112,  4, 112, 13, SSD1306_WHITE);
-  display.drawLine(125,  4, 125, 13, SSD1306_WHITE);
-  display.drawLine(112,  4, 125,  4, SSD1306_WHITE);
-  display.drawLine(112, 13, 125, 13, SSD1306_WHITE);
+  // Battery Body Outer Line
+  display.drawLine(110,  4, 110,  9, SSD1306_WHITE);
+  display.drawLine(111,  4, 111,  9, SSD1306_WHITE);
+  display.drawLine(112,  2, 112, 11, SSD1306_WHITE);
+  display.drawLine(125,  2, 125, 11, SSD1306_WHITE);
+  display.drawLine(112,  2, 125,  2, SSD1306_WHITE);
+  display.drawLine(112, 11, 125, 11, SSD1306_WHITE);
+
+  // Separator
+  display.drawLine(0 , 15, MAX_WIDTH,  15, SSD1306_WHITE);        // Header Line
 }
 
 /**
@@ -364,8 +595,7 @@ void prepareDefaultScreen()
   prepareHeader();
 
   // Separator
-  display.drawLine(0 , 16, MAX_WIDTH,  16, SSD1306_WHITE);        // Header Line
-  display.drawLine(75, 20, 75, MAX_HEIGHT - 2, SSD1306_WHITE);    // Column Line
+  display.drawLine(75, 18, 75, MAX_HEIGHT - 2, SSD1306_WHITE);    // Column Line
 
   // Labels
   // Velocidade Milliliters per hour
@@ -388,6 +618,9 @@ void prepareDefaultScreen()
 
 }
 
+/**
+ * Prepare setup screen
+ */
 void prepareSetupScreen()
 {
   // Clear display buffer
@@ -396,8 +629,58 @@ void prepareSetupScreen()
 
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(0, 20);
-  display.print(F("SETUP @@@@@@@@@@@@@@")); 
+  display.setCursor(7, 18);
+  //               012345678901234567890
+  display.print(F("Aviso Bipi:")); 
+
+  display.setCursor(7, 30);
+  display.print(F("Resetar")); 
+
+  display.setCursor(7, 42);
+  display.print(F("Sair")); 
+
+  // display.setCursor(7, 54);
+  // display.print(F("Unused")); 
+}
+
+/**
+ * Update Setup Screen
+ */
+void updateSetup()
+{
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  // Aviso Bipi:
+  // Clear
+  display.fillRect(74, 18, 24, 8, SSD1306_BLACK);
+  // Text
+  display.setCursor(78, 18);
+  if (alert_buzzer == 0) {
+    display.print(F("Nao")); 
+  } else {
+    display.print(F("Sim")); 
+  }
+  
+  // Reset position
+  if (menu_change) {
+    display.fillRect(0, 18, 4, 62, SSD1306_BLACK);
+    menu_change = false;
+  }
+
+  // Draw menu rectangle pos
+  if (menu_pos == 0) {
+    // Alerta Bipi
+    display.fillRect(0, 18, 4, 8, SSD1306_WHITE);
+  } else if (menu_pos == 1) {
+    // Reset
+    display.fillRect(0, 30, 4, 8, SSD1306_WHITE);
+  } else {
+    // Exit
+    display.fillRect(0, 42, 4, 8, SSD1306_WHITE);
+  } 
+  // Unused
+  // display.fillRect(0, 54, 4, 8, SSD1306_WHITE);
+  
 
 }
 
@@ -408,8 +691,9 @@ void updateValues()
 {
      
   // Body Drops/sec
-  // Custom Dot
+  // Clear area
   display.fillRect(80, 22, 44, 29, SSD1306_BLACK);
+  // Text  
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(4);   
   display.setCursor(80, 22); 
@@ -419,17 +703,30 @@ void updateValues()
   display.fillRect(100, 48, 4, 4, SSD1306_WHITE);
     
   // Velocidade Milliliters per hour
+  // Clear
+  display.fillRect(24, 20, 50, 8, SSD1306_BLACK);
+  // Text
   display.setTextSize(1);
   display.setCursor(24, 20);
-  display.print(milliliters_sec); 
+  //display.print(milliliters_hour); 
+  sprintf(tmp_char10,"%.0f", milliliters_hour);
+  display.print(F(tmp_char10)); 
   display.print(F(" ml/h")); 
 
   // Total Milliliters
+  // Clear
+  display.fillRect(24, 30, 50, 8, SSD1306_BLACK);
+  // Text
   display.setCursor(24, 30);
-  display.print(total_volume); 
+  //display.print(round(total_volume)); 
+  sprintf(tmp_char10,"%.0f", total_volume);
+  display.print(F(tmp_char10)); 
   display.print(F(" ml")); 
 
   // Referência
+  // Clear
+  display.fillRect(24, 40, 50, 8, SSD1306_BLACK);
+  // Text
   display.setCursor(24, 40);
   sprintf(tmp_char10,"%.1f", set_drops_sec);
   display.print(F(tmp_char10)); 
@@ -451,7 +748,7 @@ void updateBattery()
   // Draw Text
   display.setTextSize(1);               // Normal 1:1 pixel scale
   display.setTextColor(SSD1306_WHITE);  // Draw white text
-  display.setCursor(82,5);              // Start at top-left corner
+  display.setCursor(82, 4);              // Start at top-left corner
   if (battery_status < 10) {
     display.print(F("  "));
   } else if (battery_status < 100) {
@@ -461,13 +758,23 @@ void updateBattery()
   display.print(F("%"));
   
   // Clear Battery 
-  display.fillRect(114, 6, 10, 6, SSD1306_BLACK);
+  display.fillRect(114, 5, 10, 6, SSD1306_BLACK);
   // Fill
   int bat_fill = round(battery_status / 10);
   if (bat_fill > 0) {
     // Start pos is 114, but we need fill right to left
-    display.fillRect(124 - bat_fill, 6, bat_fill, 6, SSD1306_WHITE);
+    display.fillRect(124 - bat_fill, 4, bat_fill, 6, SSD1306_WHITE);
   }
+
+  // Drawn chargin icon
+  display.drawLine(118, 5, 120, 5, SSD1306_INVERSE);
+  display.drawLine(118, 6, 122, 6, SSD1306_INVERSE);
+  display.drawLine(115, 7, 119, 7, SSD1306_INVERSE);
+  display.drawLine(117, 8, 119, 8, SSD1306_INVERSE);
+
+  // Draw a single pixel in white
+  // display.drawPixel(10, 10, SSD1306_WHITE);
+  
 }
 
 /**
@@ -475,7 +782,7 @@ void updateBattery()
  */
 void updateTime()
 {
-  int timestamp = round(millis() / 1000);
+  int timestamp = round((millis() - header_timer) / 1000);
   int hours     = floor(timestamp / 3600);
   int minutes   = floor(timestamp % 3600 / 60);
   int seconds   = timestamp % 60;
@@ -491,7 +798,7 @@ void updateTime()
 
   // Text Param
   display.setTextSize(1);
-  display.setCursor(0, 5);
+  display.setCursor(0, 4);
   display.print(F(time_string)); 
 
 }
