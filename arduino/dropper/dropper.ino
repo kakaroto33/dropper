@@ -28,6 +28,8 @@
 #include <Adafruit_GFX.h>
 #include <Preferences.h>
 
+#include "esp_sleep.h"
+
 //== SCREEN DFINITIONS ========================================================
 
 #define SSD1306_NO_SPLASH
@@ -50,6 +52,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // Timeout not interacting with setup
 #define SCREEN_SETUP_TIMEOUT     10  // In seconds
 #define SCREEN_REFERENCE_TIMEOUT 3   // In seconds
+#define SCREEN_ALERT_TIMEOUT     3   // In seconds
 
 //== ROTATORY ENCODER =========================================================
 
@@ -60,6 +63,15 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // Setup a RotaryEncoder with 2 steps per latch for the 2 signal input pins:
 RotaryEncoder encoder(ROTATORY_IN1, ROTATORY_IN2, RotaryEncoder::LatchMode::FOUR3);
 
+//== BUZZER CONFIG ============================================================
+
+#define BUZZER 25
+
+//== BATTERY CONFIG ===========================================================
+
+#define CHARGE_MON  32
+#define VBAR_MON    33
+
 //== PERSISTENT CONFIG ========================================================
 
 Preferences preferences;
@@ -68,25 +80,39 @@ Preferences preferences;
 
 #define IR_SENSOR 34
 
+//== OTHER SYSTEM DEFINITIONS =================================================
+
+#define MAX_DROPS_SECOND 99    // Fix limit drops per seconds
+
 //== GLOBAL VARIABLES =========================================================
 
-// System State
+// System State, there reset at setup()
 char display_mode = 'D';  // D = Default, S = Setings
 int setup_timout  = 0;    // Timout seup screen
 int refer_timeout = 0;
-int alert_buzzer  = 0;
+int alert_buzzer  = 1;    // Aways startup ON (1)
 bool save_changes = false;
 float ml_per_drop = 0.05;   // 0.05ml per drop or 1ml has 20 drops
-char system_state = 'N';    // N: Normal, L: Lento, P: Parado
+char system_state = 'N';    // N: Normal, L: Lento, P: Parado, R: Muito Rapido
 bool refer_adjust = false;  // Ajuste Referencia
 
 // Display Values
 int battery_status         = 0;
+bool battery_charging      = false;
 int drops_second           = 0;
 float milliliters_hour     = 0;
 float total_volume         = 0;
 float set_drops_sec        = 0;
 unsigned long header_timer = 0;
+
+// Battery reading
+int vbat_leng   = 6;
+int vbat_list[10] = {2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000};
+// Iem Position 0 ~ 5
+int vbat_pos  = 0;
+int vbat_temp = 0;
+int vbat_now  = 0;
+int vbat_ref  = 0; // Setup referency integer
 
 // Rotatory Encoder
 int encoder_pos   = 0;
@@ -100,13 +126,17 @@ int timer_long      = 0;   // Update every 10 seconds
 int timer_ir        = 0;   // IR timer update 1sec
 int timer_tg_head   = 0;
 int timer_tg_value  = 0;
+int timer_sys_swtch = 0;
+int timer_buzzer    = 0;
 bool refresh_fast   = false;
 bool refresh_med    = false;
 bool refresh_long   = false;
 bool refresh_disp   = false; 
 bool refresh_header = false; 
 bool refresh_value  = false; 
+bool refresh_sys_sw = false; 
 bool values_toggle  = false;
+bool buzzer_toggle  = false;
 
 // Menu
 int menu_pos     = 0;
@@ -120,6 +150,7 @@ int tmp_stamp2 = 0;
 int tmp_pos    = 0;
 char tmp_char10[10];
 int tmp_int    = 0;
+bool debug_plot = false;
 
 // Multicore Tasks 
 TaskHandle_t Task1;
@@ -134,9 +165,10 @@ TaskHandle_t Task2;
  */
 void setup() {
   Serial.begin(115200); // Default speed for ESP32
+  //Serial.begin(19200); // Due low clock, console maybe is half 9600
   //
   uint32_t Freq = 0;
-  setCpuFrequencyMhz(80);
+  setCpuFrequencyMhz(80);   //  240, 160, ==> 80 (OK), -->40 (misses adc read)
   Freq = getCpuFrequencyMhz();
   Serial.print("CPU Freq = ");
   Serial.print(Freq);
@@ -171,9 +203,15 @@ void setup() {
   display.display();
 
   // Inputs
-  pinMode(ROTATORY_SWT, INPUT_PULLUP);
-  pinMode(IR_SENSOR, INPUT_PULLDOWN);
+  pinMode(ROTATORY_SWT  , INPUT_PULLUP);
+  pinMode(IR_SENSOR     , INPUT_PULLDOWN);
+  pinMode(CHARGE_MON    , INPUT_PULLDOWN);
+  pinMode(VBAR_MON      , INPUT_PULLDOWN);
 
+  // Output
+  pinMode(BUZZER, OUTPUT);
+  
+  //
   Serial.println(F("# Setup Finished"));
   Serial.print("# Setup running on core: ");
   Serial.println(xPortGetCoreID());
@@ -224,13 +262,12 @@ int still_high   = 0;
 int noise_time   = 25;
 
 // Init Drops List
-int drops_leng    = 10;
+int drops_leng     = 10;
 int drops_list[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 // Iem Position 0 ~ 5
 int drops_pos  = 0;
 int drops_temp = 0;
-
-int drop_view  = 0; //??
+int drops_ref  = 0; // Setup referency integer
 
 /**
  * Core 0 Loop
@@ -256,6 +293,11 @@ void Task1code( void * pvParameters ){
       update_drop  = tmp_stamp2;
       refresh_drop = true;
     }
+    // System swtich delay
+    refresh_sys_sw = false;
+    if (timer_sys_swtch < tmp_stamp2) {
+      refresh_sys_sw = true;
+    }
     // We don't need check voltage, only changes spikes
     ir_millis_v  = analogReadMilliVolts(IR_SENSOR);
     loop_counter++;
@@ -268,13 +310,6 @@ void Task1code( void * pvParameters ){
     // Only medium over time
     //ir_line    = (int) (ir_millis_v + (ir_line * 4)) / 5; // More slow medium change
     diff_noise = abs((int)(ir_millis_v - ir_line));
-
-    // Serial.print(ir_millis_v);
-    // Serial.print(' ');
-    // Serial.print(ir_line);
-    // Serial.print(' ');
-    // Serial.print(diff_noise);
-    // Serial.print(' ');
 
     if (abs(diff_noise) > noise_range) {
       if (still_high == 0) {
@@ -289,15 +324,19 @@ void Task1code( void * pvParameters ){
       }
     }
 
-    if (refresh_drop) {
-      drop_view = drop_count;
-    }
-
-    // if (still_high > 0) {
-    //   Serial.println(200);
-    // } else {
-    //   Serial.println(100);
-    // }
+    if (debug_plot) {
+      Serial.print(ir_millis_v);
+      Serial.print(' ');
+      Serial.print(ir_line);
+      Serial.print(' ');
+      Serial.print(diff_noise);
+      Serial.print(' ');
+      if (still_high > 0) {
+        Serial.println(200);
+      } else {
+        Serial.println(100);
+      }
+    }    
    
     //Update on 1fps
     if (refresh_drop) {
@@ -313,12 +352,28 @@ void Task1code( void * pvParameters ){
           drops_temp += drops_list[tmp_int];
         }
         drops_second = round(drops_temp / drops_leng);
+        drops_ref    = (int) (set_drops_sec * 10);
 
         //drops_second = round((drops_second + (drop_count * 30)) / 4); // 3 x More power over new counter
-        if (drops_second > 99) {
-          drops_second = 99;
-        } else if (drops_second == 0) {
-          //system_state = 'P'; // Force Warning
+        // Only switch with delay
+        if (refresh_sys_sw) {
+          // N: Normal, L: Lento, P: Parado, R: Muito Rapido
+          if (drops_second > MAX_DROPS_SECOND) {
+            drops_second = MAX_DROPS_SECOND; // limit screen
+            system_state = 'R'; 
+          } else if (drops_second <= 0) {
+            system_state = 'P'; 
+          } else if (drops_second < drops_ref) {
+            system_state = 'L'; 
+          } else if (system_state != 'N') {
+            system_state = 'N'; 
+          }
+          timer_sys_swtch = tmp_stamp2 + SCREEN_ALERT_TIMEOUT;
+        } else {
+          // Only lmiter
+          if (drops_second > MAX_DROPS_SECOND) {
+            drops_second = MAX_DROPS_SECOND; // limit screen
+          }
         }
         // Add totals
         total_volume += drop_count * ml_per_drop;
@@ -342,7 +397,7 @@ void Task1code( void * pvParameters ){
     
     // Add a small delay to let the watchdog process
     //https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
-    delay(1);
+    delay(5);
   }
 
 }
@@ -432,6 +487,16 @@ void Task2code( void * pvParameters ){
 
     // Read the state of the pushbutton value:
     if (digitalRead(ROTATORY_SWT) == LOW) {
+      // If is buzzer beeping 
+      if (alert_buzzer == 1 && display_mode == 'D' && encoder_click == 0) {
+        if (system_state == 'L' || system_state == 'P' || system_state == 'R') {
+          // just buzzer off, instead enter menu
+          alert_buzzer = 0;
+          // skip slick
+          encoder_click = 1;
+        }
+      }
+      // Normal click
       if (encoder_click == 0) {
         Serial.println("[ROTATORY_SWT:LOW]");
         if (display_mode == 'D') {
@@ -519,22 +584,143 @@ void Task2code( void * pvParameters ){
         save_changes = false;
         savePreferences();
       }
-      battery_status += 10;
     }
 
     if (refresh_disp) {
       display.display();
     }
-    
+
+    // Buzzer
+    if (alert_buzzer == 1) {
+      // N: Normal, L: Lento, P: Parado, R: Muito Rapido
+      if (system_state == 'L' || system_state == 'P' || system_state == 'R') {
+        if (timer_buzzer < tmp_millis || timer_fast == 0) {
+          if (system_state == 'L') {
+            if (!buzzer_toggle) {
+              timer_buzzer  = tmp_millis + 200;
+            } else {
+              timer_buzzer  = tmp_millis + 2000;
+            }
+
+          } else { // P: Parado, R: Muito Rapido
+            timer_buzzer  = tmp_millis + 3000;
+          }
+          buzzer_toggle = !buzzer_toggle;
+        }
+        if (buzzer_toggle) {
+          digitalWrite(BUZZER, HIGH);
+        } else {
+          digitalWrite(BUZZER, LOW);
+        }
+      } else {
+        if (buzzer_toggle) {
+          buzzer_toggle = false;
+          digitalWrite(BUZZER, LOW);
+        }
+      } 
+    } else {
+      if (buzzer_toggle) {
+        buzzer_toggle = false;
+        digitalWrite(BUZZER, LOW);
+      }
+    }
+
+    // Battery
+    // Charging
+    if (refresh_med) {
+      tmp_int = analogRead(CHARGE_MON);
+      if (tmp_int > 500) { // Normally read 1600
+        battery_charging = true;
+      } else {
+        battery_charging = false;
+      }
+      
+    }
+    // Voltage Status
+    if (refresh_med) {
+      vbat_now = analogRead(VBAR_MON);
+      // Register on rotative list (6 indexes)
+      vbat_list[vbat_pos] = vbat_now;
+      vbat_pos++;
+      if (vbat_pos >= vbat_leng) {
+        vbat_pos = 0;
+      }
+      // Get medium
+      vbat_temp = 0;
+      for (tmp_int = 0; tmp_int < vbat_leng; tmp_int++) {
+        vbat_temp += vbat_list[tmp_int];
+      }
+      vbat_ref    = (int) round(vbat_temp / vbat_leng);
+      // Serial.print(F("# Battery Vref: "));
+      // Serial.println(vbat_ref);
+      // 4.1V ~= 100% ~= 2290 vref
+      // 3.1V  = 1%   ~= 1690 vref
+      // Error Low Bat 
+      // 3.0   =      ~= 1600 vref // Keep battery safe, enter in deep slepp
+      //
+      // 4.1/3.1 = 2290/1690 = 100/1
+      // (2290 - 1690) = 600
+      // (2290 - 1690)/600 = 1 (100%)
+      // ((X - 1690)/600) * 100  = y%
+      // (X - 1690)/6  = y%
+      tmp_int = (int) round((vbat_ref - 1690) / 6);
+      if (tmp_int < 0) {
+        tmp_int = 0; // keep positive
+      } else if (tmp_int > 100) {
+        tmp_int = 100; // keep positive
+      }
+      battery_status = tmp_int;
+
+      // Spceial State
+      // - If has battery: vbat_now > 500
+      // - If charge is : 0%
+      // - Show message battery low for 10 seconds
+      // - Enter in deep sleep
+      // Obs: For deve and test, must poweroff switch if battery is low
+      //if (tmp_int == 0 && vbat_now > 500) {
+      if (tmp_int == 0 && vbat_now > 500) { 
+          digitalWrite(BUZZER, LOW);
+          showLowBatteryAlert();
+          delay(10000); 
+          display.clearDisplay();
+          display.display();
+          delay(100); 
+          // Enter deep sleep
+          powerOffSystem();
+      }
+
+      // Serial.print(F("# Battery %: "));
+      // Serial.println(battery_status);
+    }    
     // Add a small delay to let the watchdog process
     //https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
-    delay(1); // Pause for 0.05 second
+    delay(5); // Pause for 0.05 second
   }
 }
 
 //=============================================================================
 //== FUNCTIONS ================================================================
 //=============================================================================
+
+/**
+ * Do deep sleep to power off
+ */
+void powerOffSystem()
+{
+  // Disable IOs
+  pinMode(BUZZER, INPUT_PULLDOWN);
+  pinMode(ROTATORY_SWT, INPUT_PULLDOWN);
+  // https://forum.arduino.cc/t/hibernate-on-arduino-nano-esp32/1214370
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_OFF);
+  //esp_sleep_pd_config(ESP_PD_DOMAIN_ULP, ESP_PD_OPTION_OFF);
+  //esp_deep_sleep_pd_config(ESP_PD_DOMAIN_ULP, ESP_PD_OPTION_OFF);
+  
+  // Enter deep sleep
+  esp_deep_sleep_start();
+}
 
 /**
  * Load persistent preferences
@@ -550,7 +736,7 @@ void loadPreferences()
 
   // Get the counter value, if the key does not exist, return a default value of 0
   // Note: Key name is limited to 15 chars.
-  alert_buzzer   = preferences.getInt("alert_buzzer", 0);
+  //alert_buzzer   = preferences.getInt("alert_buzzer", 0); // Don't need
   set_drops_sec  = preferences.getFloat("set_drops_sec", 0);
   
   // Close the Preferences
@@ -570,7 +756,7 @@ void savePreferences()
   preferences.begin("dropper", false);
 
   // Store the counter to the Preferences
-  preferences.putInt("alert_buzzer", alert_buzzer);
+  //preferences.putInt("alert_buzzer", alert_buzzer); // Don't need
   preferences.putFloat("set_drops_sec", set_drops_sec);
 
   // Close the Preferences
@@ -582,11 +768,31 @@ void savePreferences()
  */
 void resetData() {
   battery_status   = 0;
+  battery_charging = false;
   drops_second     = 0;
   milliliters_hour = 0;
   total_volume     = 0;
   header_timer     = millis();
+  alert_buzzer     = 1; // Default ON (1)
   loadPreferences();
+}
+
+/**
+ * Low battery Alert
+ */
+void showLowBatteryAlert() 
+{
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(26, 0);
+  display.print(F("BATERIA")); 
+  display.setCursor(38, 17);
+  display.print(F("MUITO")); 
+  display.setCursor(38, 33);
+  display.print(F("BAIXA")); 
+  display.setCursor(2, 49);
+  display.print(F("DESLIGANDO")); 
+  display.display();
 }
 
 /**
@@ -629,7 +835,7 @@ void updateHeader()
   updateSpeaker();
 
   if (refresh_header) {
-    if (system_state == 'L' || system_state == 'P') {
+    if (system_state == 'L' || system_state == 'P' || system_state == 'R') {
       display.fillRect(0, 0, SCREEN_WIDTH, 16, SSD1306_INVERSE);
     }
   }
@@ -643,9 +849,6 @@ void prepareDefaultScreen()
   // Clear display buffer
   display.clearDisplay(); 
   //prepareHeader();
-
-  
-
 }
 
 /**
@@ -746,13 +949,12 @@ void updateValues()
       refresh_value = !refresh_value;
   } 
   
-  //char system_state = 'N';  // N: Normal, L: Lento, P: Parado
   values_toggle = true;
    
   if (refer_adjust) {
     // In adjust reference fixed 
     values_toggle = false;
-  } else if (system_state == 'L' || system_state == 'P') {
+  } else if (system_state == 'L' || system_state == 'P' || system_state == 'R') {  // N: Normal, L: Lento, P: Parado, R: Muito Rapido
     values_toggle = refresh_value;
   } 
   
@@ -775,6 +977,11 @@ void updateValues()
     } else if (system_state == 'P') {
       display.setCursor(2, 30);
       display.print(F("PARADO")); 
+    } else if (system_state == 'R') {
+      display.setCursor(2, 22);
+      display.print(F("MUITO")); 
+      display.setCursor(2, 42);
+      display.print(F("RAPIDO")); 
     } 
     if (!refer_adjust) {
       display.fillRect(0, 17, 74, 45, SSD1306_INVERSE);
@@ -847,10 +1054,12 @@ void updateBattery()
   }
 
   // Drawn chargin icon
-  display.drawLine(116, 5, 118, 5, SSD1306_INVERSE);
-  display.drawLine(116, 6, 120, 6, SSD1306_INVERSE);
-  display.drawLine(113, 7, 117, 7, SSD1306_INVERSE);
-  display.drawLine(115, 8, 117, 8, SSD1306_INVERSE);
+  if (battery_charging) {
+    display.drawLine(116, 5, 118, 5, SSD1306_INVERSE);
+    display.drawLine(116, 6, 120, 6, SSD1306_INVERSE);
+    display.drawLine(113, 7, 117, 7, SSD1306_INVERSE);
+    display.drawLine(115, 8, 117, 8, SSD1306_INVERSE);
+  }
 
   // Draw a single pixel in white
   // display.drawPixel(10, 10, SSD1306_WHITE);
@@ -907,187 +1116,3 @@ void updateTime()
   display.print(F(time_string)); 
 
 }
-
-/*
-void testareas() {
-  int16_t i;
-
-  display.clearDisplay(); // Clear display buffer
-  // Yellow Bar
-  display.drawLine(0, 0, display.width()-1, 0, SSD1306_WHITE);
-  display.drawLine(0, 15, display.width()-1, 15, SSD1306_WHITE);
-
-  // Body
-  display.drawLine(0, 16, display.width()-20, 16, SSD1306_WHITE);
-  display.drawLine(0, display.height() - 1, display.width()-20, display.height() - 1, SSD1306_WHITE);
-
-  display.display();
-
-  // 
-  // for(i=0; i < 17; i++) {
-  //   display.drawLine(0, i, display.width()-1, i, SSD1306_WHITE);
-  //   display.display();
-  //   delay(1);
-  // }
-  // delay(250);
-  // for(i=18; i < display.height(); i++) {
-  //   display.drawLine(0, i, display.width()-20, i, SSD1306_WHITE);
-  //   display.display();
-  //   delay(1);
-  // }
-
-  delay(250);
-}
-
-void testdrawline() {
-  int16_t i;
-
-  display.clearDisplay(); // Clear display buffer
-
-  for(i=0; i<display.width(); i+=4) {
-    display.drawLine(0, 0, i, display.height()-1, SSD1306_WHITE);
-    display.display(); // Update screen with each newly-drawn line
-    delay(1);
-  }
-  for(i=0; i<display.height(); i+=4) {
-    display.drawLine(0, 0, display.width()-1, i, SSD1306_WHITE);
-    display.display();
-    delay(1);
-  }
-  delay(250);
-
-  display.clearDisplay();
-
-  for(i=0; i<display.width(); i+=4) {
-    display.drawLine(0, display.height()-1, i, 0, SSD1306_WHITE);
-    display.display();
-    delay(1);
-  }
-  for(i=display.height()-1; i>=0; i-=4) {
-    display.drawLine(0, display.height()-1, display.width()-1, i, SSD1306_WHITE);
-    display.display();
-    delay(1);
-  }
-  delay(250);
-
-  display.clearDisplay();
-
-  for(i=display.width()-1; i>=0; i-=4) {
-    display.drawLine(display.width()-1, display.height()-1, i, 0, SSD1306_WHITE);
-    display.display();
-    delay(1);
-  }
-  for(i=display.height()-1; i>=0; i-=4) {
-    display.drawLine(display.width()-1, display.height()-1, 0, i, SSD1306_WHITE);
-    display.display();
-    delay(1);
-  }
-  delay(250);
-
-  display.clearDisplay();
-
-  for(i=0; i<display.height(); i+=4) {
-    display.drawLine(display.width()-1, 0, 0, i, SSD1306_WHITE);
-    display.display();
-    delay(1);
-  }
-  for(i=0; i<display.width(); i+=4) {
-    display.drawLine(display.width()-1, 0, i, display.height()-1, SSD1306_WHITE);
-    display.display();
-    delay(1);
-  }
-
-  delay(2000); // Pause for 2 seconds
-}
-
-void testdrawrect(void) {
-  display.clearDisplay();
-
-  for(int16_t i=0; i<display.height()/2; i+=2) {
-    display.drawRect(i, i, display.width()-2*i, display.height()-2*i, SSD1306_WHITE);
-    display.display(); // Update screen with each newly-drawn rectangle
-    delay(1);
-  }
-
-  delay(2000);
-}
-
-void testfillrect(void) {
-  display.clearDisplay();
-
-  for(int16_t i=0; i<display.height()/2; i+=3) {
-    // The INVERSE color is used so rectangles alternate white/black
-    display.fillRect(i, i, display.width()-i*2, display.height()-i*2, SSD1306_INVERSE);
-    display.display(); // Update screen with each newly-drawn rectangle
-    delay(1);
-  }
-
-  delay(2000);
-}
-
-
-void testdrawchar(void) {
-  display.clearDisplay();
-
-  display.setTextSize(1);      // Normal 1:1 pixel scale
-  display.setTextColor(SSD1306_WHITE); // Draw white text
-  display.setCursor(0, 0);     // Start at top-left corner
-  display.cp437(true);         // Use full 256 char 'Code Page 437' font
-
-  // Not all the characters will fit on the display. This is normal.
-  // Library will draw what it can and the rest will be clipped.
-  for(int16_t i=0; i<256; i++) {
-    if(i == '\n') display.write(' ');
-    else          display.write(i);
-  }
-
-  display.display();
-  delay(2000);
-}
-
-void testdrawstyles(void) {
-  display.clearDisplay();
-
-  display.setTextSize(1);             // Normal 1:1 pixel scale
-  display.setTextColor(SSD1306_WHITE);        // Draw white text
-  display.setCursor(0,0);             // Start at top-left corner
-  display.println(F("Hello, world!"));
-
-  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE); // Draw 'inverse' text
-  display.println(3.141592);
-
-  display.setTextSize(2);             // Draw 2X-scale text
-  display.setTextColor(SSD1306_WHITE);
-  display.print(F("0x")); display.println(0xDEADBEEF, HEX);
-
-  display.display();
-  delay(2000);
-}
-
-void testscrolltext(void) {
-  display.clearDisplay();
-
-  display.setTextSize(2); // Draw 2X-scale text
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(10, 0);
-  display.println(F("scroll"));
-  display.display();      // Show initial text
-  delay(100);
-
-  // Scroll in various directions, pausing in-between:
-  display.startscrollright(0x00, 0x0F);
-  delay(2000);
-  display.stopscroll();
-  delay(1000);
-  display.startscrollleft(0x00, 0x0F);
-  delay(2000);
-  display.stopscroll();
-  delay(1000);
-  display.startscrolldiagright(0x00, 0x07);
-  delay(2000);
-  display.startscrolldiagleft(0x00, 0x07);
-  delay(2000);
-  display.stopscroll();
-  delay(1000);
-}
-*/
